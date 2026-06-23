@@ -1,0 +1,4 @@
+xui-db/
+ssl/
+secrets/
+*.log
