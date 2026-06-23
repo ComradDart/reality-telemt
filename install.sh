@@ -8,9 +8,14 @@
 #  Telegram — telemt (fake-TLS). 3x-ui засевается через CLI + HTTP-API (полный JSON).
 #
 #  СТАТУС РЕАЛИЗАЦИИ:
-#    [x] Стадия 1 — OUTBOUND: 3x-ui VLESS-Reality + nginx + HAProxy + certbot
-#    [ ] Стадия 2 — OUTBOUND: telemt (Telegram)              (следующий шаг)
-#    [ ] Стадия 3 — INBOUND + AmneziaWG-туннель (двойной прыжок)
+#    [x] OUTBOUND: 3x-ui VLESS-Reality + nginx + HAProxy + certbot
+#    [x] OUTBOUND: telemt (Telegram, опционально)
+#    [x] OUTBOUND: AmneziaWG-фолбэк (wg-easy, опционально)
+#    [ ] INBOUND: HAProxy-релей на 443 (двойной прыжок)      (следующий шаг)
+#
+#  Каналы: VLESS-Reality — ОСНОВНОЙ; AmneziaWG — ЗАПАСНОЙ (failover на клиенте);
+#  telemt — Telegram. Межсерверного туннеля нет: Reality-поток сам идёт сквозь
+#  границу (HAProxy inbound -> HAProxy outbound на 443).
 #
 #  ОС: Ubuntu 22.04/24.04, Debian 11/12.  Запуск: bash install.sh (от root)
 #  Лог: /var/log/reality_telemt.log
@@ -199,12 +204,39 @@ if [[ "$CERT_MODE" == "3" && ! -s "$CF_CREDS_FILE" ]]; then
     while true; do read -rsp "  API-токен Cloudflare (скрыт): " CF_TOKEN; echo ""; [[ -n "$CF_TOKEN" ]] && break; echo "  Пусто."; done
 fi
 
-# Reality: маскировочный (чужой) домен
+# Доп.вопросы outbound: маска Reality, опц. telemt (Telegram), опц. AWG-фолбэк
+ENABLE_TELEMT="${ENABLE_TELEMT:-no}"
+TELEMT_TLS_DOMAIN="${TELEMT_TLS_DOMAIN:-www.apple.com}"
+TELEMT_PORT="${TELEMT_PORT:-8443}"
+ENABLE_AWG="${ENABLE_AWG:-no}"
+WG_PORT="${WG_PORT:-51820}"
 if [[ "$ROLE" == "outbound" ]]; then
     echo ""
     echo "Reality маскируется под чужой сайт (его SNI шлёт клиент; должен быть доступен"
     echo "с этого сервера, поддерживать TLS1.3+H2 и НЕ быть заблокирован в РФ)."
     read -rp "Маска Reality (dest/serverName) [$DEF_REALITY_SNI]: " REALITY_SNI; REALITY_SNI="${REALITY_SNI:-$DEF_REALITY_SNI}"
+
+    echo ""
+    [[ "$ENABLE_TELEMT" == "yes" ]] && DT=y || DT=N
+    read -rp "Включить Telegram-выход telemt? [y/N] [$DT]: " a; a="${a:-$DT}"
+    case "$a" in y|Y|yes|да|1) ENABLE_TELEMT=yes ;; *) ENABLE_TELEMT=no ;; esac
+    if [[ "$ENABLE_TELEMT" == "yes" ]]; then
+        while true; do
+            read -rp "Маска fake-TLS Telegram (ДРУГОЙ домен, не как у Reality) [$TELEMT_TLS_DOMAIN]: " a
+            TELEMT_TLS_DOMAIN="${a:-$TELEMT_TLS_DOMAIN}"
+            [[ "$TELEMT_TLS_DOMAIN" != "$REALITY_SNI" ]] && break
+            echo "  Должна отличаться от маски Reality ($REALITY_SNI) — иначе HAProxy не разведёт SNI."
+        done
+        read -rp "Порт telemt (за HAProxy, 127.0.0.1) [$TELEMT_PORT]: " a; TELEMT_PORT="${a:-$TELEMT_PORT}"
+    fi
+
+    echo ""
+    [[ "$ENABLE_AWG" == "yes" ]] && DA=y || DA=N
+    read -rp "Включить ЗАПАСНОЙ AmneziaWG (wg-easy, на случай если VLESS прижмут)? [y/N] [$DA]: " a; a="${a:-$DA}"
+    case "$a" in y|Y|yes|да|1) ENABLE_AWG=yes ;; *) ENABLE_AWG=no ;; esac
+    if [[ "$ENABLE_AWG" == "yes" ]]; then
+        read -rp "Порт AmneziaWG (UDP) [$WG_PORT]: " a; WG_PORT="${a:-$WG_PORT}"
+    fi
 fi
 
 deploy_file "$ANSWERS_FILE" 600 <<EOF >/dev/null || true
@@ -214,8 +246,13 @@ SERVER_HOST="$SERVER_HOST"
 CERT_MODE="$CERT_MODE"
 LE_EMAIL="$LE_EMAIL"
 REALITY_SNI="${REALITY_SNI:-$DEF_REALITY_SNI}"
+ENABLE_TELEMT="$ENABLE_TELEMT"
+TELEMT_TLS_DOMAIN="$TELEMT_TLS_DOMAIN"
+TELEMT_PORT="$TELEMT_PORT"
+ENABLE_AWG="$ENABLE_AWG"
+WG_PORT="$WG_PORT"
 EOF
-log "Параметры: роль=$ROLE, адрес=$SERVER_HOST, cert=режим$CERT_MODE, reality=${REALITY_SNI:-—}"
+log "Параметры: роль=$ROLE, адрес=$SERVER_HOST, cert=режим$CERT_MODE, reality=${REALITY_SNI:-—}, telemt=$ENABLE_TELEMT, awg=$ENABLE_AWG"
 
 # ==============================================================================
 # ШАГ 1. Базовые пакеты
@@ -277,7 +314,10 @@ ufw default allow outgoing >/dev/null
 ufw allow "$SSH_PORT/tcp" >/dev/null && log "ufw: $SSH_PORT/tcp"
 ufw allow 80/tcp  >/dev/null && log "ufw: 80/tcp"
 ufw allow 443/tcp >/dev/null && log "ufw: 443/tcp"
-# панель 3x-ui (2053) НЕ открываем наружу — доступ по SSH-туннелю
+# панель 3x-ui (2053) и wg-easy (51821) НЕ открываем наружу — доступ по SSH-туннелю
+if [[ "$ROLE" == "outbound" && "$ENABLE_AWG" == "yes" ]]; then
+    ufw allow "$WG_PORT/udp" >/dev/null && log "ufw: $WG_PORT/udp (AmneziaWG-фолбэк)"
+fi
 ufw status | grep -q "Status: active" && skip "ufw активен" || { log "Включаю ufw"; ufw --force enable; }
 
 # ==============================================================================
@@ -319,14 +359,21 @@ VLESS_UUID="${VLESS_UUID:-$(cat /proc/sys/kernel/random/uuid)}"
 REALITY_SHORTID="${REALITY_SHORTID:-$(openssl rand -hex 8)}"
 REALITY_PRIVATE_KEY="${REALITY_PRIVATE_KEY:-}"
 REALITY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-}"
-deploy_file "$SECRETS_FILE" 600 <<EOF >/dev/null || true
+TELEMT_SECRET="${TELEMT_SECRET:-$(openssl rand -hex 16)}"
+WG_ADMIN_PASS="${WG_ADMIN_PASS:-$(openssl rand -base64 24 | tr -d '=+/' | cut -c1-24)}"
+write_secrets() {
+    deploy_file "$SECRETS_FILE" 600 <<EOF >/dev/null || true
 XUI_ADMIN_USER="$XUI_ADMIN_USER"
 XUI_ADMIN_PASS="$XUI_ADMIN_PASS"
 VLESS_UUID="$VLESS_UUID"
 REALITY_SHORTID="$REALITY_SHORTID"
 REALITY_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
 REALITY_PUBLIC_KEY="$REALITY_PUBLIC_KEY"
+TELEMT_SECRET="$TELEMT_SECRET"
+WG_ADMIN_PASS="$WG_ADMIN_PASS"
 EOF
+}
+write_secrets
 
 # ==============================================================================
 # Сертификат для nginx-сайта (общая функция)
@@ -390,7 +437,15 @@ EOF
 }
 render_nginx >/dev/null || true
 
-# --- HAProxy :443 SNI: Reality-маска -> 3x-ui; иначе -> легит-сайт ---
+# --- HAProxy :443 SNI: Reality-маска -> 3x-ui; маска telemt -> telemt; иначе -> сайт ---
+TG_ACL=""; TG_BE=""
+if [[ "$ENABLE_TELEMT" == "yes" ]]; then
+    TG_ACL="    acl sni_tg req.ssl_sni -i $TELEMT_TLS_DOMAIN
+    use_backend be_tg if sni_tg"
+    TG_BE="
+backend be_tg
+    server tg 127.0.0.1:$TELEMT_PORT send-proxy-v2 check"
+fi
 deploy_file "$HAPROXY_CFG" 644 <<EOF >/dev/null || true
 global
     log stdout format raw local0
@@ -409,15 +464,17 @@ frontend fe_443
     tcp-request content accept if { req_ssl_hello_type 1 }
     acl sni_reality req.ssl_sni -i $REALITY_SNI
     use_backend be_xui if sni_reality
+$TG_ACL
     default_backend be_site
 backend be_xui
     server xui 127.0.0.1:$XUI_REALITY_PORT check
 backend be_site
-    server site 127.0.0.1:$SITE_TLS_PORT check
+    server site 127.0.0.1:$SITE_TLS_PORT check$TG_BE
 EOF
 
-# --- docker-compose: 3x-ui + nginx + haproxy (все host-net) ---
-deploy_file "$STACK_DIR/docker-compose.yml" 600 <<EOF >/dev/null || true
+# --- docker-compose: 3x-ui + nginx + haproxy (host-net) [+ telemt] [+ wg-easy] ---
+compose_yml() {
+    cat <<EOF
 services:
   3x-ui:
     image: $XUI_IMAGE
@@ -450,6 +507,153 @@ services:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     restart: unless-stopped
 EOF
+    if [[ "$ENABLE_TELEMT" == "yes" ]]; then
+        cat <<'EOF'
+  telemt:
+    image: ghcr.io/telemt/telemt:latest
+    container_name: telemt
+    network_mode: host
+    working_dir: /run/telemt
+    command: ["/etc/telemt/config.toml"]
+    volumes:
+      - ./telemt:/etc/telemt:rw
+    tmpfs:
+      - /run/telemt:rw,mode=1777,size=16m
+    restart: unless-stopped
+EOF
+    fi
+    if [[ "$ENABLE_AWG" == "yes" ]]; then
+        cat <<EOF
+  wg-easy:
+    image: ghcr.io/wg-easy/wg-easy:15
+    container_name: wg-easy
+    environment:
+      - INSECURE=true
+      - EXPERIMENTAL_AWG=true
+      - INIT_ENABLED=true
+      - INIT_USERNAME=$XUI_ADMIN_USER
+      - INIT_PASSWORD=$WG_ADMIN_PASS
+      - INIT_HOST=$SERVER_HOST
+      - INIT_PORT=$WG_PORT
+    networks:
+      wg:
+        ipv4_address: 10.42.42.42
+    volumes:
+      - etc_wireguard:/etc/wireguard
+      - /lib/modules:/lib/modules:ro
+    ports:
+      - "$WG_PORT:$WG_PORT/udp"
+      - "127.0.0.1:51821:51821/tcp"
+    cap_add: [NET_ADMIN, SYS_MODULE]
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.src_valid_mark=1
+    restart: unless-stopped
+EOF
+    fi
+    if [[ "$ENABLE_AWG" == "yes" ]]; then
+        cat <<'EOF'
+
+volumes:
+  etc_wireguard:
+networks:
+  wg:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.42.42.0/24
+EOF
+    fi
+}
+deploy_file "$STACK_DIR/docker-compose.yml" 600 < <(compose_yml) >/dev/null || true
+
+# --- telemt config (ДО подъёма: telemt читает при старте; 644 — non-root контейнер) ---
+if [[ "$ENABLE_TELEMT" == "yes" ]]; then
+    mkdir -p "$STACK_DIR/telemt"
+    deploy_file "$STACK_DIR/telemt/config.toml" 644 <<EOF >/dev/null || true
+[general]
+fast_mode        = true
+use_middle_proxy = true
+log_level        = "normal"
+tg_connect       = 10
+
+[general.modes]
+classic = false
+secure  = false
+tls     = true
+
+[general.links]
+show        = "*"
+public_host = "$SERVER_HOST"
+public_port = 443
+
+[network]
+ipv4   = true
+ipv6   = false
+prefer = 4
+
+[timeouts]
+client_handshake = 15
+client_keepalive = 60
+
+[server]
+port           = $TELEMT_PORT
+proxy_protocol = true
+client_mss     = "tspu"
+
+[server.api]
+enabled   = true
+listen    = "127.0.0.1:9091"
+whitelist = ["127.0.0.1/32", "::1/128"]
+
+[[server.listeners]]
+ip = "127.0.0.1"
+
+[censorship]
+tls_domain         = "$TELEMT_TLS_DOMAIN"
+mask               = true
+mask_port          = 443
+tls_emulation      = true
+tls_front_dir      = "tlsfront"
+unknown_sni_action = "reject_handshake"
+fake_cert_len      = 2048
+
+[access]
+replay_check_len = 65536
+ignore_time_skew = false
+
+[access.users]
+user1 = "$TELEMT_SECRET"
+EOF
+fi
+
+# --- AmneziaWG модуль ядра (нужен wg-easy с EXPERIMENTAL_AWG) ---
+install_awg_module() {
+    modinfo amneziawg >/dev/null 2>&1 && { skip "Модуль amneziawg уже есть"; return 0; }
+    log "Ставлю модуль ядра AmneziaWG (для wg-easy)"
+    [[ -f /etc/apt/sources.list ]] && sed -i -E 's/^#\s*(deb-src\s)/\1/' /etc/apt/sources.list || true
+    shopt -s nullglob; for f in /etc/apt/sources.list.d/*.sources; do sed -i 's/^Types: deb$/Types: deb deb-src/' "$f"; done; shopt -u nullglob
+    apt_install "linux-headers-$(uname -r)" || { [[ "$OS_ID" == ubuntu ]] && apt_install linux-headers-generic || apt_install linux-headers-amd64; }
+    if ! ls /etc/apt/sources.list.d/ 2>/dev/null | grep -qi amnezia; then
+        if [[ "$OS_ID" == ubuntu ]]; then
+            apt_install software-properties-common python3-launchpadlib; add-apt-repository -y ppa:amnezia/ppa
+        else
+            local kr=/usr/share/keyrings/amnezia-ppa.gpg fpr=75C9DD72C799870E310542E24166F2C257290828 t; t=$(mktemp -d)
+            gpg --homedir "$t" --keyserver hkps://keyserver.ubuntu.com --recv-keys "$fpr"
+            gpg --homedir "$t" --export "$fpr" > "$kr"; rm -rf "$t"
+            cat > /etc/apt/sources.list.d/amnezia-ppa.list <<E2
+deb [signed-by=$kr] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main
+deb-src [signed-by=$kr] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main
+E2
+        fi
+    fi
+    apt-get update; apt-get install -y amneziawg
+    printf 'amneziawg\n' > /etc/modules-load.d/amneziawg.conf
+}
+if [[ "$ENABLE_AWG" == "yes" ]]; then
+    install_awg_module
+    lsmod | grep -qw amneziawg || modprobe amneziawg || warn "modprobe amneziawg не удался — wg-easy откатится на обычный WG"
+fi
 
 # Освобождаем 80/443 от системного nginx, если был
 if systemctl is-active --quiet nginx 2>/dev/null; then
@@ -480,14 +684,7 @@ if [[ -z "$REALITY_PRIVATE_KEY" || -z "$REALITY_PUBLIC_KEY" ]]; then
     REALITY_PRIVATE_KEY=$(echo "$XOUT" | awk -F': *' '/[Pp]rivate/{print $2}' | tr -d ' \r' | head -1)
     REALITY_PUBLIC_KEY=$(echo "$XOUT"  | awk -F': *' '/[Pp]ublic/{print $2}'  | tr -d ' \r' | head -1)
     [[ -n "$REALITY_PRIVATE_KEY" && -n "$REALITY_PUBLIC_KEY" ]] || die "Не удалось сгенерировать Reality-ключи (xray x25519). Лог: docker logs 3x-ui"
-    deploy_file "$SECRETS_FILE" 600 <<EOF >/dev/null || true
-XUI_ADMIN_USER="$XUI_ADMIN_USER"
-XUI_ADMIN_PASS="$XUI_ADMIN_PASS"
-VLESS_UUID="$VLESS_UUID"
-REALITY_SHORTID="$REALITY_SHORTID"
-REALITY_PRIVATE_KEY="$REALITY_PRIVATE_KEY"
-REALITY_PUBLIC_KEY="$REALITY_PUBLIC_KEY"
-EOF
+    write_secrets
     log "Reality-ключи сгенерированы"
 fi
 
@@ -551,41 +748,65 @@ EOF
     fi
 fi
 
-# --- Клиентская VLESS-Reality ссылка (на Стадии 1 — напрямую к этому серверу) ---
+# --- Клиентские ссылки (одиночный сервер; при двойном прыжке server = inbound) ---
 VLESS_LINK="vless://${VLESS_UUID}@${SERVER_HOST}:443?type=tcp&security=reality&pbk=${REALITY_PUBLIC_KEY}&fp=chrome&sni=${REALITY_SNI}&sid=${REALITY_SHORTID}&flow=xtls-rprx-vision#${SERVER_HOST}-reality"
+
+TG_BLOCK=""
+if [[ "$ENABLE_TELEMT" == "yes" ]]; then
+    TLS_HEX=$(printf '%s' "$TELEMT_TLS_DOMAIN" | od -An -tx1 | tr -d ' \n')
+    TG_LINK="tg://proxy?server=${SERVER_HOST}&port=443&secret=ee${TELEMT_SECRET}${TLS_HEX}"
+    sleep 2
+    [[ "$(docker inspect -f '{{.State.Running}}' telemt 2>/dev/null || echo false)" == "true" ]] \
+        && log "telemt запущен" || warn "telemt не запустился — docker logs telemt"
+    TG_BLOCK="
+ Telegram (telemt, маска $TELEMT_TLS_DOMAIN):
+ $TG_LINK"
+fi
+AWG_BLOCK=""
+if [[ "$ENABLE_AWG" == "yes" ]]; then
+    AWG_BLOCK="
+ AmneziaWG (ЗАПАСНОЙ, прямое подключение к этому серверу, порт $WG_PORT/udp):
+   панель wg-easy: http://127.0.0.1:51821  (SSH-туннель: ssh -L 51821:127.0.0.1:51821 $NEW_USER@$SERVER_HOST)
+   логин/пароль:   $XUI_ADMIN_USER / $WG_ADMIN_PASS
+   (создайте клиента в панели → отдайте конфиг как запасной профиль)"
+fi
 
 deploy_file "$INFO_FILE" 600 <<EOF >/dev/null || true
 ============================================================
- reality-telemt — OUTBOUND (Стадия 1)
+ reality-telemt — OUTBOUND
 ============================================================
  Панель 3x-ui:   http://127.0.0.1:$XUI_PANEL_PORT  (только локально!)
    доступ:       ssh -L $XUI_PANEL_PORT:127.0.0.1:$XUI_PANEL_PORT $NEW_USER@$SERVER_HOST
-                 затем открыть http://127.0.0.1:$XUI_PANEL_PORT
    логин/пароль: $XUI_ADMIN_USER / $XUI_ADMIN_PASS
  Легит-сайт TLS: $CERT_DESC
  SSH:            $NEW_USER@$SERVER_HOST (root по SSH запрещён, порт $SSH_PORT/tcp)
 
- VLESS-Reality (на Стадии 1 — прямое подключение к этому серверу):
+ VLESS-Reality (ОСНОВНОЙ; при двойном прыжке server заменить на inbound):
  $VLESS_LINK
 
  Маска Reality: $REALITY_SNI   UUID: $VLESS_UUID
- (двойной прыжок и telemt — Стадии 2-3)
+$TG_BLOCK
+$AWG_BLOCK
+
+ Двойной прыжок (inbound в РФ) — Стадия следующего шага.
 ============================================================
 EOF
 
 echo ""
 echo "=============================================================="
-echo "  OUTBOUND (Стадия 1) ГОТОВ"
+echo "  OUTBOUND ГОТОВ"
 echo "=============================================================="
 echo ""
 echo "  Панель 3x-ui:  http://127.0.0.1:$XUI_PANEL_PORT  (по SSH-туннелю)"
 echo "    ssh -L $XUI_PANEL_PORT:127.0.0.1:$XUI_PANEL_PORT $NEW_USER@$SERVER_HOST"
 echo "    логин/пароль: $XUI_ADMIN_USER / $XUI_ADMIN_PASS"
 echo ""
-echo "  VLESS-Reality ссылка (импортируйте в клиент):"
+echo "  VLESS-Reality (основной, импортируйте в клиент):"
 echo "    $VLESS_LINK"
+[[ "$ENABLE_TELEMT" == "yes" ]] && { echo ""; echo "  Telegram: $TG_LINK"; }
+[[ "$ENABLE_AWG" == "yes" ]] && { echo ""; echo "  AWG-фолбэк: панель wg-easy http://127.0.0.1:51821 (SSH -L), $XUI_ADMIN_USER / $WG_ADMIN_PASS"; }
 echo ""
 echo "  Памятка: $INFO_FILE   Лог: $LOG_FILE"
 echo "  ВАЖНО: проверьте вход в новом окне (ssh $NEW_USER@$SERVER_HOST) — root по SSH закрыт."
 echo ""
-log "Стадия 1 завершена"
+log "Готово (outbound)"

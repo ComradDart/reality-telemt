@@ -27,10 +27,15 @@
 | Стадия | Что | Статус |
 |---|---|---|
 | 1 | OUTBOUND: 3x-ui VLESS-Reality + nginx + HAProxy + certbot | ✅ готово |
-| 2 | OUTBOUND: telemt (Telegram) | ⏳ следующий шаг |
-| 3 | INBOUND + AmneziaWG-туннель (двойной прыжок) | ⏳ |
+| 2 | OUTBOUND: telemt (Telegram) | ✅ готово (опц.) |
+| 3 | OUTBOUND: AmneziaWG-фолбэк (wg-easy, опц.) | ✅ готово (опц.) |
+| 4 | INBOUND: HAProxy-релей на 443 (двойной прыжок) | ⏳ следующий шаг |
 
-Стадия 1 тестируется на **одном** зарубежном сервере (прямое подключение VLESS-Reality).
+Весь OUTBOUND тестируется на **одном** зарубежном сервере (прямое подключение VLESS-Reality /
+Telegram / AWG). INBOUND (двойной прыжок) — когда поднимешь второй сервер.
+
+**Каналы (по приоритету):** VLESS-Reality — основной; AmneziaWG — запасной (переключение делает
+клиент, напр. Hiddify/sing-box urltest); telemt — для Telegram.
 
 ## Запуск
 
